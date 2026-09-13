@@ -1,0 +1,968 @@
+---
+title: "Supervised Learning (Regression)"
+subtitle: "Energy Efficiency - Heating Load"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  rmdformats::readthedown:
+    self_contained: true
+    thumbnails: false
+    lightbox: true
+    gallery: true
+    highlight: tango
+    toc_depth: 2
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  fig.width = 10,
+  fig.height = 6,
+  dpi = 120
+)
+
+required_packages <- c(
+  "rmdformats", "knitr", "readxl", "pls", "glmnet", "e1071", "caret",
+  "rpart", "rpart.plot", "partykit", "ipred",
+  "randomForest", "Cubist"
+)
+
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0) {
+  stop(
+    "Install the following packages before knitting: ",
+    paste(missing_packages, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+# Attach pls because some releases of validation helpers resolve RMSEP through
+# the package search path even when the model itself is called with pls::pcr().
+suppressPackageStartupMessages(library(pls))
+
+set.seed(2026)
+
+# Report palette supplied for this homework. Reused across the main figures.
+plot_palette <- c(
+  "#855e5c",
+  "#e39e83",
+  "#f7bf97",
+  "#f7e2a9",
+  "#77ad95"
+)
+```
+
+<style>
+:root {
+  --report-primary: #855e5c;
+  --report-secondary: #e39e83;
+  --report-accent: #f7bf97;
+  --report-light: #f7e2a9;
+  --report-green: #77ad95;
+  --report-code-bg: #FAF7F3;
+  --report-code-border: #E6D8CF;
+  --report-text: #262626;
+}
+
+.wy-side-nav-search,
+.wy-side-nav-search > a {
+  background-color: var(--report-green) !important;
+}
+
+.wy-nav-side,
+.wy-menu-vertical {
+  background-color: var(--report-primary) !important;
+}
+
+.wy-nav-content-wrap,
+.wy-nav-content {
+  background: #FFFFFF;
+}
+
+h1, h2, h3, h4,
+.title {
+  color: var(--report-primary) !important;
+  font-family: Georgia, "Times New Roman", serif;
+  font-weight: 700;
+}
+
+body {
+  color: var(--report-text);
+  font-family: Arial, Helvetica, sans-serif;
+}
+
+pre:not(.sourceCode),
+div.sourceCode > pre.sourceCode {
+  background-color: var(--report-code-bg) !important;
+  border: 1px solid var(--report-code-border) !important;
+  border-radius: 5px;
+}
+
+pre.sourceCode code,
+pre.sourceCode span,
+pre.sourceCode a {
+  border: 0 !important;
+  border-bottom: 0 !important;
+  box-shadow: none !important;
+  text-decoration: none !important;
+}
+
+.wy-menu-vertical a {
+  color: #FFFFFF;
+}
+
+.wy-menu-vertical a:hover,
+.wy-menu-vertical li.current > a {
+  background: var(--report-secondary) !important;
+  color: #2B2422 !important;
+}
+
+.rst-versions,
+.rst-versions .rst-current-version {
+  background: var(--report-green) !important;
+}
+
+table {
+  width: 100%;
+}
+
+table tbody tr:nth-child(even) {
+  background-color: #FFF9ED;
+}
+
+table thead {
+  background-color: var(--report-light);
+}
+
+/* Keep every figure caption below the image. */
+.figure p.caption,
+.figure .caption,
+p.caption {
+  text-align: center;
+  font-size: 0.95em;
+  font-style: italic;
+  color: #555555;
+  margin-top: 8px;
+  margin-bottom: 18px;
+}
+</style>
+
+# Data Preparation
+
+The Energy Efficiency dataset contains 768 building configurations. Eight building-design variables are used to predict Heating Load (Y1). Cooling Load (Y2) is available in the source dataset but is excluded from the present analysis so that the homework follows a single-response regression framework.
+
+```{r load-data}
+# The Excel file should be saved in the same folder as this R Markdown file.
+# During knitting, find that folder explicitly instead of relying on RStudio's
+# current working directory.
+rmd_input <- knitr::current_input(dir = TRUE)
+
+if (is.null(rmd_input) || length(rmd_input) == 0 || !nzchar(rmd_input)) {
+  rmd_dir <- getwd()
+} else {
+  rmd_dir <- dirname(
+    normalizePath(rmd_input, winslash = "/", mustWork = FALSE)
+  )
+}
+
+search_dirs <- unique(c(rmd_dir, getwd()))
+preferred_names <- c(
+  "ENB2012_data(1).xlsx",
+  "ENB2012_data.xlsx"
+)
+
+candidate_files <- unlist(
+  lapply(search_dirs, function(d) {
+    c(
+      file.path(d, preferred_names),
+      list.files(
+        path = d,
+        pattern = "^ENB2012_data.*\\.xlsx$",
+        full.names = TRUE,
+        ignore.case = TRUE
+      )
+    )
+  }),
+  use.names = FALSE
+)
+
+candidate_files <- unique(candidate_files[file.exists(candidate_files)])
+
+if (length(candidate_files) == 0) {
+  stop(
+    paste0(
+      "Energy Efficiency Excel file not found. Save ENB2012_data.xlsx ",
+      "or ENB2012_data(1).xlsx in the same folder as this Rmd file, then knit again."
+    ),
+    call. = FALSE
+  )
+}
+
+# Use an absolute normalized path and read_xlsx() explicitly. This avoids
+# readxl having to guess the workbook format during knitting.
+dataset_path <- normalizePath(
+  candidate_files[1],
+  winslash = "/",
+  mustWork = TRUE
+)
+
+energy_raw <- readxl::read_xlsx(
+  path = dataset_path,
+  sheet = 1
+)
+energy_raw <- as.data.frame(energy_raw)
+
+required_columns <- c(
+  "Relative Compactness(X1)",
+  "Surface Area(X2)",
+  "Wall Area(X3)",
+  "Roof Area(X4)",
+  "Overall Height(X5)",
+  "Orientation(X6)",
+  "Glazing Area(X7)",
+  "Glazing Area Distribution(X8)",
+  "Heating Load(Y1)",
+  "Cooling Load(Y2)"
+)
+
+missing_columns <- setdiff(required_columns, names(energy_raw))
+extra_columns <- setdiff(names(energy_raw), required_columns)
+
+if (length(missing_columns) > 0) {
+  stop(
+    "The selected dataset is missing these required columns: ",
+    paste(missing_columns, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+if (length(extra_columns) > 0) {
+  message(
+    "Additional columns will not be used in this analysis: ",
+    paste(extra_columns, collapse = ", ")
+  )
+}
+
+energy_raw <- energy_raw[, required_columns]
+
+if (!all(vapply(energy_raw, is.numeric, logical(1)))) {
+  stop("All ten required columns must contain numeric data.", call. = FALSE)
+}
+
+if (anyNA(energy_raw)) {
+  stop("The selected dataset contains missing values.", call. = FALSE)
+}
+
+names(energy_raw) <- c(
+  "RelativeCompactness",
+  "SurfaceArea",
+  "WallArea",
+  "RoofArea",
+  "OverallHeight",
+  "Orientation",
+  "GlazingArea",
+  "GlazingAreaDistribution",
+  "HeatingLoad",
+  "CoolingLoad"
+)
+
+predictor_names <- c(
+  "RelativeCompactness",
+  "SurfaceArea",
+  "WallArea",
+  "RoofArea",
+  "OverallHeight",
+  "Orientation",
+  "GlazingArea",
+  "GlazingAreaDistribution"
+)
+
+# CoolingLoad is intentionally excluded so the analysis has one continuous
+# response variable, consistent with the regression workflow used in class.
+energy <- energy_raw[, c(predictor_names, "HeatingLoad")]
+
+cat("Selected dataset:", basename(dataset_path), "\n")
+cat("Dataset location:", dataset_path, "\n")
+head(energy)
+```
+
+```{r dimensions}
+dim(energy)
+```
+
+```{r structure}
+str(energy)
+```
+
+```{r summary}
+summary(energy)
+```
+
+```{r missing-values}
+colSums(is.na(energy))
+```
+
+## Training and Test Sets
+
+```{r train-test-split}
+set.seed(2026)
+training_rows <- sample(seq_len(nrow(energy)), size = floor(0.80 * nrow(energy)))
+
+train_data <- energy[training_rows, ]
+test_data  <- energy[-training_rows, ]
+
+rmse <- function(actual, predicted) {
+  sqrt(mean((actual - predicted)^2))
+}
+
+mse <- function(actual, predicted) {
+  mean((actual - predicted)^2)
+}
+
+mae <- function(actual, predicted) {
+  mean(abs(actual - predicted))
+}
+
+r_squared <- function(actual, predicted) {
+  1 - sum((actual - predicted)^2) /
+    sum((actual - mean(actual))^2)
+}
+
+model_results <- data.frame(
+  Model = character(),
+  MSE = numeric(),
+  RMSE = numeric(),
+  MAE = numeric(),
+  R2 = numeric(),
+  stringsAsFactors = FALSE
+)
+
+add_result <- function(model_name, actual, predicted) {
+  data.frame(
+    Model = model_name,
+    MSE = mse(actual, predicted),
+    RMSE = rmse(actual, predicted),
+    MAE = mae(actual, predicted),
+    R2 = r_squared(actual, predicted)
+  )
+}
+
+c(Training = nrow(train_data), Test = nrow(test_data))
+```
+
+# Ordinary Least Squares Regression
+
+```{r ordinary-least-squares}
+fit_lm <- lm(HeatingLoad ~ ., data = train_data)
+summary(fit_lm)
+```
+
+```{r ordinary-least-squares-predictions}
+pred_lm <- predict(fit_lm, newdata = test_data)
+model_results <- rbind(
+  model_results,
+  add_result("Ordinary Least Squares", test_data$HeatingLoad, pred_lm)
+)
+model_results[nrow(model_results), ]
+```
+
+# Stepwise Linear Regression
+
+```{r stepwise-regression}
+fit_step <- step(fit_lm, direction = "both", trace = 0)
+summary(fit_step)
+```
+
+```{r stepwise-predictions}
+pred_step <- predict(fit_step, newdata = test_data)
+model_results <- rbind(
+  model_results,
+  add_result("Stepwise Linear Regression", test_data$HeatingLoad, pred_step)
+)
+model_results[nrow(model_results), ]
+```
+
+# Principal Component Regression
+
+```{r principal-component-regression, fig.cap="PCR cross-validated RMSEP"}
+fit_pcr <- pls::pcr(
+  HeatingLoad ~ .,
+  data = train_data,
+  scale = TRUE,
+  validation = "CV"
+)
+summary(fit_pcr)
+pcr_rmsep <- pls::RMSEP(fit_pcr)
+plot(
+  pcr_rmsep,
+  main = "",
+  col = c(plot_palette[1], plot_palette[2]),
+  lwd = 1.5
+)
+```
+
+```{r principal-component-predictions}
+pcr_components <- max(1, pls::selectNcomp(fit_pcr, method = "onesigma", plot = FALSE))
+pred_pcr <- as.numeric(predict(fit_pcr, newdata = test_data, ncomp = pcr_components))
+model_results <- rbind(
+  model_results,
+  add_result("Principal Component Regression", test_data$HeatingLoad, pred_pcr)
+)
+model_results[nrow(model_results), ]
+```
+
+# Partial Least Squares Regression
+
+```{r partial-least-squares, fig.cap="PLS cross-validated RMSEP"}
+fit_pls <- pls::plsr(
+  HeatingLoad ~ .,
+  data = train_data,
+  scale = TRUE,
+  validation = "CV"
+)
+summary(fit_pls)
+pls_rmsep <- pls::RMSEP(fit_pls)
+plot(
+  pls_rmsep,
+  main = "",
+  col = c(plot_palette[5], plot_palette[3]),
+  lwd = 1.5
+)
+```
+
+```{r partial-least-squares-predictions}
+pls_components <- max(1, pls::selectNcomp(fit_pls, method = "onesigma", plot = FALSE))
+pred_pls <- as.numeric(predict(fit_pls, newdata = test_data, ncomp = pls_components))
+model_results <- rbind(
+  model_results,
+  add_result("Partial Least Squares", test_data$HeatingLoad, pred_pls)
+)
+model_results[nrow(model_results), ]
+```
+
+# Penalized Regression
+
+```{r penalized-data}
+x_train <- model.matrix(HeatingLoad ~ ., train_data)[, -1]
+y_train <- train_data$HeatingLoad
+x_test  <- model.matrix(HeatingLoad ~ ., test_data)[, -1]
+y_test  <- test_data$HeatingLoad
+
+# Reproduce the standard cv.glmnet display while using the homework palette.
+# The vertical bars show +/- 1 standard error around the cross-validated mean.
+# The numbers across the top show the number of nonzero coefficients.
+plot_cv_glmnet_palette <- function(
+  cvfit,
+  point_col = plot_palette[2],
+  error_col = plot_palette[4],
+  line_col = plot_palette[5]
+) {
+  # Match the native plot.cv.glmnet orientation used in the reference code:
+  # the horizontal axis is -Log(lambda), not Log(lambda).
+  sign_lambda <- -1
+  x <- sign_lambda * log(cvfit$lambda)
+  y <- cvfit$cvm
+  lower <- cvfit$cvlo
+  upper <- cvfit$cvup
+
+  plot(
+    x, y,
+    type = "n",
+    ylim = range(c(lower, upper), finite = TRUE),
+    xlab = expression(-Log(lambda)),
+    ylab = if (!is.null(cvfit$name)) cvfit$name else "Mean-Squared Error",
+    main = ""
+  )
+
+  cap_width <- diff(range(x)) / 250
+
+  segments(
+    x, lower, x, upper,
+    col = error_col,
+    lwd = 1
+  )
+  segments(
+    x - cap_width, lower, x + cap_width, lower,
+    col = error_col,
+    lwd = 1
+  )
+  segments(
+    x - cap_width, upper, x + cap_width, upper,
+    col = error_col,
+    lwd = 1
+  )
+
+  points(
+    x, y,
+    pch = 20,
+    cex = 0.85,
+    col = point_col
+  )
+
+  abline(
+    v = sign_lambda * log(cvfit$lambda.min),
+    lty = 3,
+    lwd = 1,
+    col = line_col
+  )
+  abline(
+    v = sign_lambda * log(cvfit$lambda.1se),
+    lty = 3,
+    lwd = 1,
+    col = line_col
+  )
+
+  # Use the same degrees-of-freedom/nonzero-coefficient information shown
+  # across the top of the native cv.glmnet plot.
+  nz <- if (!is.null(cvfit$nzero)) cvfit$nzero else cvfit$nz
+
+  axis(
+    3,
+    at = x,
+    labels = nz,
+    tick = FALSE,
+    line = 0
+  )
+}
+```
+
+## Ridge Regression
+
+```{r ridge-regression, fig.cap="Ridge regression cross-validation"}
+set.seed(2026)
+fit_ridge <- glmnet::cv.glmnet(
+  x_train, y_train,
+  alpha = 0,
+  family = "gaussian",
+  nfolds = 10
+)
+
+plot_cv_glmnet_palette(
+  fit_ridge,
+  point_col = plot_palette[1],
+  error_col = plot_palette[4],
+  line_col = plot_palette[5]
+)
+
+fit_ridge$lambda.min
+fit_ridge$lambda.1se
+```
+
+```{r ridge-predictions}
+pred_ridge <- as.numeric(predict(fit_ridge, newx = x_test, s = "lambda.min"))
+model_results <- rbind(
+  model_results,
+  add_result("Ridge Regression", y_test, pred_ridge)
+)
+model_results[nrow(model_results), ]
+```
+
+# Least Absolute Shrinkage and Selection Operator
+
+```{r lasso-regression, fig.cap="LASSO cross-validation"}
+set.seed(2026)
+fit_lasso <- glmnet::cv.glmnet(
+  x_train, y_train,
+  alpha = 1,
+  family = "gaussian",
+  nfolds = 10
+)
+
+plot_cv_glmnet_palette(
+  fit_lasso,
+  point_col = plot_palette[2],
+  error_col = plot_palette[4],
+  line_col = plot_palette[5]
+)
+
+coef(fit_lasso, s = "lambda.min")
+```
+
+```{r lasso-predictions}
+pred_lasso <- as.numeric(predict(fit_lasso, newx = x_test, s = "lambda.min"))
+model_results <- rbind(
+  model_results,
+  add_result("LASSO", y_test, pred_lasso)
+)
+model_results[nrow(model_results), ]
+```
+
+# Elastic Net
+
+```{r elastic-net, fig.cap="Elastic Net cross-validation"}
+set.seed(2026)
+elastic_candidates <- lapply(seq(0.1, 0.9, by = 0.1), function(a) {
+  model <- glmnet::cv.glmnet(
+    x_train, y_train,
+    alpha = a,
+    family = "gaussian",
+    nfolds = 10
+  )
+  list(alpha = a, model = model, error = min(model$cvm))
+})
+
+best_elastic <- elastic_candidates[[
+  which.min(vapply(elastic_candidates, `[[`, numeric(1), "error"))
+]]
+
+best_elastic$alpha
+best_elastic$model$lambda.min
+best_elastic$model$lambda.1se
+
+plot_cv_glmnet_palette(
+  best_elastic$model,
+  point_col = plot_palette[3],
+  error_col = plot_palette[4],
+  line_col = plot_palette[5]
+)
+```
+
+```{r elastic-net-predictions}
+pred_elastic <- as.numeric(
+  predict(best_elastic$model, newx = x_test, s = "lambda.min")
+)
+model_results <- rbind(
+  model_results,
+  add_result("Elastic Net", y_test, pred_elastic)
+)
+model_results[nrow(model_results), ]
+```
+
+# Non-Linear Regression
+
+## Support Vector Regression
+
+```{r support-vector-regression}
+set.seed(2026)
+fit_svr <- e1071::tune.svm(
+  HeatingLoad ~ .,
+  data = train_data,
+  kernel = "radial",
+  gamma = 2^(-6:-3),
+  cost = 2^(1:4),
+  tunecontrol = e1071::tune.control(cross = 5)
+)
+fit_svr$best.parameters
+```
+
+```{r support-vector-predictions}
+pred_svr <- predict(fit_svr$best.model, newdata = test_data)
+model_results <- rbind(
+  model_results,
+  add_result("Support Vector Regression", y_test, pred_svr)
+)
+model_results[nrow(model_results), ]
+```
+
+## KNN
+
+```{r knn-regression, fig.cap="KNN cross-validation performance across candidate k values"}
+set.seed(2026)
+fit_knn <- caret::train(
+  HeatingLoad ~ .,
+  data = train_data,
+  method = "knn",
+  preProcess = c("center", "scale"),
+  tuneGrid = data.frame(k = seq(3, 25, by = 2)),
+  trControl = caret::trainControl(method = "cv", number = 10)
+)
+fit_knn
+knn_plot <- plot(fit_knn, col = plot_palette[5], pch = 16)
+print(update(knn_plot, main = NULL))
+```
+
+```{r knn-predictions}
+pred_knn <- predict(fit_knn, newdata = test_data)
+model_results <- rbind(
+  model_results,
+  add_result("KNN", y_test, pred_knn)
+)
+model_results[nrow(model_results), ]
+```
+
+# Non-Linear Regression with Decision Trees
+
+The regression tree is pruned using cross-validation and is limited to at most five splits for a clear, interpretable visualization.
+
+```{r regression-tree, fig.cap="Cross-validated error used to guide regression-tree pruning"}
+set.seed(2026)
+
+# Grow a candidate tree first.
+fit_tree_full <- rpart::rpart(
+  HeatingLoad ~ .,
+  data = train_data,
+  method = "anova",
+  control = rpart::rpart.control(
+    cp = 0.001,
+    minsplit = 60,
+    minbucket = 25,
+    maxdepth = 6,
+    xval = 10
+  )
+)
+
+# Review the cross-validated error for candidate tree sizes.
+rpart::printcp(fit_tree_full)
+
+old_par <- par(
+  col = plot_palette[1],
+  col.axis = plot_palette[1],
+  col.lab = plot_palette[1]
+)
+rpart::plotcp(fit_tree_full, main = "")
+par(old_par)
+
+# Keep the final explanatory tree compact. Among candidate trees with at most
+# five splits, choose the one with the smallest cross-validated error.
+cp_table <- fit_tree_full$cptable
+max_display_splits <- 5
+
+eligible_rows <- which(cp_table[, "nsplit"] <= max_display_splits)
+
+selected_row <- eligible_rows[
+  which.min(cp_table[eligible_rows, "xerror"])
+]
+
+selected_cp <- cp_table[selected_row, "CP"]
+fit_tree <- rpart::prune(fit_tree_full, cp = selected_cp)
+
+cat("Selected pruning CP:", selected_cp, "\n")
+cat("Selected number of splits:", cp_table[selected_row, "nsplit"], "\n")
+cat(
+  "Terminal nodes before pruning:",
+  sum(fit_tree_full$frame$var == "<leaf>"),
+  "\n"
+)
+cat(
+  "Terminal nodes after pruning:",
+  sum(fit_tree$frame$var == "<leaf>"),
+  "\n"
+)
+
+print(fit_tree)
+```
+
+```{r regression-tree-standard-plot, fig.width=12, fig.height=7, dpi=160, out.width="100%", fig.cap="Pruned regression tree for heating load"}
+rpart.plot::rpart.plot(
+  fit_tree,
+  type = 2,
+  extra = 101,
+  fallen.leaves = TRUE,
+  box.palette = plot_palette[c(4, 3, 2, 1, 5)],
+  shadow.col = "gray85",
+  branch = 0.5,
+  tweak = 1.15,
+  split.cex = 1.05,
+  nn = FALSE,
+  roundint = FALSE
+)
+```
+
+```{r regression-tree-fancy-plot, fig.width=12, fig.height=7, dpi=160, out.width="100%", fig.cap="Alternative visualization of the pruned heating-load regression tree"}
+rpart.plot::prp(
+  fit_tree,
+  type = 2,
+  extra = 101,
+  fallen.leaves = TRUE,
+  box.palette = plot_palette[c(5, 4, 3, 2, 1)],
+  branch.col = plot_palette[1],
+  split.col = plot_palette[1],
+  leaf.round = 1,
+  branch = 0.5,
+  tweak = 1.10,
+  faclen = 0,
+  varlen = 0
+)
+```
+
+```{r regression-tree-predictions}
+pred_tree <- predict(fit_tree, newdata = test_data)
+model_results <- rbind(
+  model_results,
+  add_result("Regression Tree", y_test, pred_tree)
+)
+model_results[nrow(model_results), ]
+```
+
+## Conditional Inference Tree
+
+The conditional inference tree is fitted independently within each branch. Therefore, the same predictor can appear in more than one branch when it is statistically informative for different subgroups of the data.
+
+```{r conditional-inference-tree, fig.width=12, fig.height=8, dpi=160, out.width="100%", fig.cap="Conditional inference tree for heating load"}
+fit_ctree <- partykit::ctree(
+  HeatingLoad ~ .,
+  data = train_data,
+  control = partykit::ctree_control(
+    mincriterion = 0.99,
+    minsplit = 100,
+    minbucket = 50,
+    maxdepth = 2
+  )
+)
+plot(
+  fit_ctree,
+  type = "simple",
+  gp = grid::gpar(fontsize = 12, col = plot_palette[1])
+)
+```
+
+```{r conditional-inference-tree-predictions}
+pred_ctree <- predict(fit_ctree, newdata = test_data)
+model_results <- rbind(
+  model_results,
+  add_result("Conditional Inference Tree", y_test, pred_ctree)
+)
+model_results[nrow(model_results), ]
+```
+
+# Bagging CART
+
+```{r bagging-cart}
+set.seed(2026)
+fit_bagging <- ipred::bagging(
+  HeatingLoad ~ .,
+  data = train_data,
+  nbagg = 100,
+  coob = TRUE,
+  control = rpart::rpart.control(minsplit = 20, cp = 0)
+)
+fit_bagging
+```
+
+```{r bagging-predictions}
+pred_bagging <- predict(fit_bagging, newdata = test_data)
+model_results <- rbind(
+  model_results,
+  add_result("Bagging CART", y_test, pred_bagging)
+)
+model_results[nrow(model_results), ]
+```
+
+# Random Forest
+
+```{r random-forest, fig.cap="Random Forest variable importance"}
+set.seed(2026)
+fit_rf <- randomForest::randomForest(
+  HeatingLoad ~ .,
+  data = train_data,
+  ntree = 500,
+  importance = TRUE
+)
+fit_rf
+randomForest::importance(fit_rf)
+randomForest::varImpPlot(fit_rf, col = plot_palette[1], pch = 19, main = "")
+```
+
+```{r random-forest-predictions}
+pred_rf <- predict(fit_rf, newdata = test_data)
+model_results <- rbind(
+  model_results,
+  add_result("Random Forest", y_test, pred_rf)
+)
+model_results[nrow(model_results), ]
+```
+
+# Cubist
+
+```{r cubist}
+set.seed(2026)
+fit_cubist <- Cubist::cubist(
+  x = train_data[, predictor_names],
+  y = train_data$HeatingLoad,
+  committees = 1,
+  neighbors = 0
+)
+summary(fit_cubist)
+```
+
+```{r cubist-predictions}
+pred_cubist <- predict(fit_cubist, newdata = test_data[, predictor_names])
+model_results <- rbind(
+  model_results,
+  add_result("Cubist", y_test, pred_cubist)
+)
+model_results[nrow(model_results), ]
+```
+
+# Model Comparison
+
+```{r model-comparison}
+model_results <- model_results[order(model_results$RMSE), ]
+rownames(model_results) <- NULL
+
+knitr::kable(
+  model_results,
+  digits = 3,
+  caption = "Test-set performance of the regression models"
+)
+```
+
+```{r model-comparison-plot, fig.height=6, fig.cap="Test-set RMSE comparison across regression models"}
+# Use the supplied five-color palette. The best model receives the darkest
+# shade and the remaining models cycle through the complementary colors.
+comparison_colors <- rep(
+  c(plot_palette[5], plot_palette[4], plot_palette[3], plot_palette[2]),
+  length.out = nrow(model_results)
+)
+comparison_colors[which.min(model_results$RMSE)] <- plot_palette[1]
+
+par(mar = c(5, 12, 4, 2))
+barplot(
+  rev(model_results$RMSE),
+  names.arg = rev(model_results$Model),
+  horiz = TRUE,
+  las = 1,
+  col = rev(comparison_colors),
+  border = NA,
+  xlab = "RMSE",
+  col.axis = plot_palette[1],
+  col.lab = plot_palette[1],
+  col.main = plot_palette[1]
+)
+```
+
+# Model Selection and Interpretation
+
+The recommended model below is selected automatically from the held-out test results. No model name is hard-coded as the winner.
+
+```{r final-model-selection, echo=FALSE, results='asis'}
+best_model <- model_results[which.min(model_results$RMSE), ]
+
+interpretability_note <- if (grepl(
+  "Ordinary|Stepwise|Ridge|LASSO|Elastic|Principal|Partial",
+  best_model$Model
+)) {
+  "Its fitted coefficients can be examined to understand the direction and relative size of each predictor's relationship with heating load."
+} else if (grepl("Tree", best_model$Model)) {
+  "Its decision rules and tree diagram provide a direct visual explanation of how predictor thresholds lead to different heating-load predictions."
+} else if (best_model$Model == "Random Forest") {
+  "It is less transparent than a single regression tree, but the variable-importance plot shows which predictors contribute most strongly to its predictions."
+} else if (best_model$Model == "Cubist") {
+  "Its rule-based linear models provide more interpretation than many black-box methods because the conditions and regression equations can be inspected."
+} else {
+  "It provides strong predictive performance, although its internal prediction process is less directly interpretable than a linear model or a small decision tree."
+}
+
+cat("## Recommended model\n\n")
+cat(sprintf(
+  "Based on the held-out test results, **%s** should be selected for this dataset. It produced the lowest RMSE (**%.3f heating-load units**), meaning that its predictions typically differed from the observed heating-load values by approximately %.3f units when larger errors were given extra weight. Its MSE was **%.3f**, its MAE was **%.3f heating-load units**, and its test-set R-squared was **%.3f**. Therefore, the model explains approximately **%.1f%%** of the variation in heating load in the test data.\n\n",
+  best_model$Model,
+  best_model$RMSE,
+  best_model$RMSE,
+  best_model$MSE,
+  best_model$MAE,
+  best_model$R2,
+  100 * best_model$R2
+))
+cat(
+  "RMSE was used as the primary selection criterion because all models were evaluated on the same unseen test observations and RMSE penalizes large prediction errors. MAE was reviewed as an easily interpreted average error, MSE confirmed the squared-error ranking, and R-squared measured explained variation. The model-comparison chart supports the decision visually: the selected model has the shortest RMSE bar. ",
+  interpretability_note,
+  " Together, the test metrics, visualization, and interpretability assessment provide the basis for the final selection.\n",
+  sep = ""
+)
+```
